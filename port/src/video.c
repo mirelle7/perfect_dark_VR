@@ -9,6 +9,7 @@
 #include "config.h"
 #include "system.h"
 #include "video.h"
+#include "ext_tex.h"
 
 #include "../fast3d/gfx_api.h"
 #include "../fast3d/gfx_sdl.h"
@@ -550,8 +551,14 @@ void videoSetOverexposureScale(f32 scale)
 
 void videoSetExternalTextures(s32 external)
 {
+	const s32 wasExternal = texExternal;
 	texExternal = !!external;
 	gfx_external_textures_enabled = (bool)texExternal;
+
+	if (texExternal && !wasExternal) {
+		// Decode what is already on screen; it appears over the next frames
+		extTexPrefetchRecorded();
+	}
 }
 
 s32 videoCreateFramebuffer(u32 w, u32 h, s32 upscale, s32 autoresize)
@@ -614,7 +621,17 @@ void videoCopyFramebuffer(s32 dst, s32 src, s32 left, s32 top)
 
 void videoResetTextureCache(void)
 {
-    gfx_texture_cache_clear();
+    // Called at the start of every stage load: the N64 textures live in stage
+    // memory and must go, but decoded HD replacements stay on the GPU.
+    gfx_texture_cache_reset_stage();
+    extTexStageBegin();
+}
+
+void videoFinishStageLoad(void)
+{
+    // Wait for the HD textures the stage just requested, so none of them
+    // appear as N64 textures first.
+    gfx_ext_tex_finish_stage_load();
 }
 
 void videoFreeCachedTexture(const void *texptr)

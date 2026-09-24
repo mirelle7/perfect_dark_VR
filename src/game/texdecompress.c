@@ -13,6 +13,7 @@
 #ifndef PLATFORM_N64
 #include "mod.h"
 #include "platform.h"
+#include "ext_tex.h"
 #endif
 
 struct texture *g_Textures;
@@ -2233,6 +2234,11 @@ void texLoad(texnum_t *updateword, struct texpool *pool, bool unusedarg)
 	// If the value at updateword isn't already a pointer
 	if ((*updateword & 0xffff0000) == 0 || (*updateword & 0xffff0000) == 0xabcd0000) {
 		g_TexNumToLoad = *updateword & 0xffff;
+
+#ifndef PLATFORM_N64
+		// Start decoding the HD replacement now so it is ready by the first draw
+		extTexPrefetch(G_TEXTYPE_GENERAL, 0, g_TexNumToLoad);
+#endif
 
 		tex = texFindInPool(g_TexNumToLoad, pool);
 

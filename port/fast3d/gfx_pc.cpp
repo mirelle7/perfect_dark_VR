@@ -18,6 +18,7 @@
 #include <iostream>
 #include <memory>
 #include <limits>
+#include <chrono>
 
 #ifndef _LANGUAGE_C
 #define _LANGUAGE_C
@@ -41,6 +42,7 @@
 #include "../vr/vr_log.h"
 extern "C" {
 #include "ext_tex.h"
+#include "system.h"
 }
 
 #include "../vr/vr_hub.h"
@@ -75,6 +77,10 @@ uintptr_t gfxFramebuffer;
 #define MAX_VERTEX_COLORS 64
 
 #define TEXTURE_CACHE_MAX_SIZE 1024
+// Longest a stage load will wait for its HD textures before carrying on
+#define EXT_TEX_PREFETCH_TIMEOUT_MS 6000
+// HD texture data uploaded ahead of use per gameplay frame (one 1024x1024 RGBA)
+#define EXT_TEX_UPLOAD_BYTES_PER_FRAME (4 * 1024 * 1024)
 
 #define C0(pos, width) ((cmd->words.w0 >> (pos)) & ((1U << width) - 1))
 #define C1(pos, width) ((cmd->words.w1 >> (pos)) & ((1U << width) - 1))
@@ -625,7 +631,31 @@ void gfx_texture_cache_clear() {
     gfx_texture_cache.lru.clear();
     rdp.textures_changed[0] = rdp.textures_changed[1] = true;
     memset(rendering_state.textures, 0, sizeof(rendering_state.textures));
-    extTexFree();
+}
+
+// Drops the N64 textures but keeps the external ones: those are keyed by
+// texture number rather than by address, so they stay valid across stages and
+// don't need decoding again.
+static void gfx_texture_cache_clear_native(bool refresh_samplers) {
+    gfx_flush();
+    for (auto it = gfx_texture_cache.map.begin(); it != gfx_texture_cache.map.end(); ) {
+        if (!(it->first.ext_key >> 7*8)) {
+            gfx_texture_cache.lru.erase(it->second.lru_location);
+            gfx_texture_cache.free_texture_ids.push_back(it->second.texture_id);
+            it = gfx_texture_cache.map.erase(it);
+        } else {
+            if (refresh_samplers) {
+                it->second.cms = 0xff; // forces set_sampler_parameters on next use
+            }
+            ++it;
+        }
+    }
+    rdp.textures_changed[0] = rdp.textures_changed[1] = true;
+    memset(rendering_state.textures, 0, sizeof(rendering_state.textures));
+}
+
+extern "C" void gfx_texture_cache_reset_stage(void) {
+    gfx_texture_cache_clear_native(false);
 }
 
 static bool gfx_texture_cache_lookup(int i, const TextureCacheKey& key) {
@@ -993,6 +1023,19 @@ static void import_texture(int i, int tile, bool is_rect) {
     }
 
     if (gfx_texture_cache_lookup(i, key)) {
+        if (external && !rendering_state.textures[i]->second.ext_hd) {
+            // Still showing a placeholder (the N64 texture, or the previous
+            // pack's): make sure the HD version is on its way, or upload it now
+            // if it is already decoded.
+            uint32_t width, height;
+            uint8_t *addr = extTexLoad(loaded_texture.type, loaded_texture.id | loaded_texture.id_mask,
+                                       loaded_texture.texnum, &width, &height);
+            if (addr) {
+                gfx_rapi->upload_texture(addr, width, height);
+                extTexFreePixels(addr);
+                rendering_state.textures[i]->second.ext_hd = true;
+            }
+        }
         loaded_texture.id_mask = 0;
         return;
     }
@@ -1007,9 +1050,9 @@ static void import_texture(int i, int tile, bool is_rect) {
 
         uint8_t *addr = extTexLoad(type, id, texnum, &width, &height);
         if (!addr) {
-            // HD texture not ready yet: display the native N64 texture in the meantime.
-            // idmask=0 so that the next cache lookup remains a "miss" until the HD
-            // version is confirmed to be available.
+            // HD texture not decoded yet: display the native N64 texture in the
+            // meantime. It is cached under the external key, and gfx_ext_tex_pump
+            // replaces it in place once the decode finishes.
             loaded_texture.id_mask = 0;
 
             if (loaded_texture.addr) {
@@ -1023,6 +1066,8 @@ static void import_texture(int i, int tile, bool is_rect) {
             return;
         }
         gfx_rapi->upload_texture(addr, width, height);
+        extTexFreePixels(addr);
+        rendering_state.textures[i]->second.ext_hd = true;
         return;
     }
 
@@ -2118,20 +2163,90 @@ static inline uint64_t make_key(bool external, uint64_t type, uint64_t id, uint3
 }
 
 //VR ext textures
-void gfx_texture_cache_invalidate_ext(u8 type, u16 id, u32 texnum)
-{
-    gfx_flush();
-    uint64_t extkey = make_key(1, type, id, texnum);
-    for (auto it = gfx_texture_cache.map.begin(); it != gfx_texture_cache.map.end(); ) {
-        if (it->first.ext_key == extkey) {
-            gfx_texture_cache.lru.erase(it->second.lru_location);
-            gfx_texture_cache.free_texture_ids.push_back(it->second.texture_id);
-            it = gfx_texture_cache.map.erase(it);
-        } else {
-            ++it;
-        }
+
+// Same key import_texture builds for an external texture. Font outlines carry
+// their mask in id_mask rather than in the id.
+static TextureCacheKey ext_cache_key(uint8_t type, uint16_t id, uint32_t texnum) {
+    uint16_t mask = (type == G_TEXTYPE_FONT) ? (id & IDMASK_FONT_OUTLINE_BIT) : 0;
+    return { 0, {}, 0, 0, 0, make_key(1, type, id & ~mask, texnum), mask };
+}
+
+// After a pack change: what is on the GPU is now only a placeholder
+static void gfx_ext_tex_mark_stale(void) {
+    for (auto& entry : gfx_texture_cache.map) {
+        entry.second.ext_hd = false;
     }
-    rdp.textures_changed[0] = rdp.textures_changed[1] = true;
+}
+
+extern "C" s32 gfx_ext_tex_resident(u8 type, u16 id, s32 texnum) {
+    auto it = gfx_texture_cache.map.find(ext_cache_key(type, id, texnum));
+    return it != gfx_texture_cache.map.end() && it->second.ext_hd;
+}
+
+// Uploads decoded HD textures into the cache before they are drawn, replacing
+// any N64 fallback that was cached under the same key. Stops after max_bytes
+// of pixel data (at least one texture) so gameplay frames never take a burst.
+static void gfx_ext_tex_pump(size_t max_bytes) {
+    size_t uploaded = 0;
+    bool any = false;
+    u8 type; u16 id; s32 texnum; u32 width, height;
+
+    while (uploaded < max_bytes) {
+        uint8_t *pixels = extTexTakeReady(&type, &id, &texnum, &width, &height);
+        if (!pixels) {
+            break;
+        }
+
+        if (!any) {
+            gfx_flush();
+            any = true;
+        }
+
+        gfx_texture_cache_lookup(0, ext_cache_key(type, id, texnum));
+        gfx_rapi->upload_texture(pixels, width, height);
+        rendering_state.textures[0]->second.ext_hd = true;
+        extTexFreePixels(pixels);
+
+        uploaded += (size_t)width * height * 4;
+    }
+
+    if (any) {
+        // The pump rebinds texture unit 0 behind the renderer's back
+        memset(rendering_state.textures, 0, sizeof(rendering_state.textures));
+        rdp.textures_changed[0] = rdp.textures_changed[1] = true;
+    }
+}
+
+// Blocks until everything queued so far is decoded and on the GPU, or until
+// the timeout. Only used while the game is loading, never during gameplay.
+extern "C" void gfx_ext_tex_prefetch_wait(uint32_t timeout_ms);
+
+extern "C" void gfx_ext_tex_finish_stage_load(void) {
+    gfx_ext_tex_prefetch_wait(EXT_TEX_PREFETCH_TIMEOUT_MS);
+}
+
+extern "C" void gfx_ext_tex_prefetch_wait(uint32_t timeout_ms) {
+    if (!gfx_external_textures_enabled) {
+        return;
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+
+    for (;;) {
+        gfx_ext_tex_pump(SIZE_MAX);
+
+        if (extTexInflight() == 0) {
+            break;
+        }
+
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        if (elapsed >= std::chrono::milliseconds(timeout_ms)) {
+            vr_log("ext_tex: prefetch wait timed out with %d textures pending", extTexInflight());
+            break;
+        }
+
+        sysSleep(10000); // 1 ms, in 100 ns units
+    }
 }
 
 static void gfx_dp_load_block(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t dxt) {
@@ -2172,7 +2287,7 @@ static void gfx_dp_load_block(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t
         loaded_texture.texnum = texnum;
         loaded_texture.id_mask = id_mask;
         loaded_texture.ext_key = make_key(1, type, id, texnum);
-        if (id_mask != 0 && !extTexExists(type, id & id_mask, texnum))
+        if (id_mask != 0 && !extTexExists(type, id | id_mask, texnum))
             loaded_texture.id_mask = 0;
     } else {
         loaded_texture.ext_key = make_key(0, type, id, texnum);
@@ -2953,6 +3068,7 @@ extern "C" void gfx_destroy(void) {
     extTexAsyncShutdown();
     // Texture cache and loaded textures store references to Resources which need to be unreferenced.
     gfx_texture_cache_clear();
+    extTexFree();
 }
 
 extern "C" struct GfxRenderingAPI* gfx_get_current_rendering_api(void) {
@@ -3038,12 +3154,23 @@ extern "C" void gfx_run(Gfx* commands) {
     ++num_dls;
     gfx_sp_reset();
 
-    {
-        u8 rType[8]; u16 rId[8]; s32 rTexnum[8];
-        s32 n = extTexPollReady(rType, rId, rTexnum, 8);
-        for (s32 i = 0; i < n; ++i)
-            gfx_texture_cache_invalidate_ext(rType[i], rId[i], rTexnum[i]);
+    if (extTexApplyPendingPack()) {
+        static bool first_pack = true;
+
+        // The external textures on the GPU belong to the old pack. Keep them as
+        // placeholders so a switch doesn't block: the new pack's versions
+        // replace them in place as they finish decoding.
+        gfx_ext_tex_mark_stale();
+        extTexPrefetchRecorded();
+
+        if (first_pack) {
+            // Startup: there are no placeholders yet, so wait instead
+            gfx_ext_tex_prefetch_wait(EXT_TEX_PREFETCH_TIMEOUT_MS);
+            first_pack = false;
+        }
     }
+
+    gfx_ext_tex_pump(EXT_TEX_UPLOAD_BYTES_PER_FRAME);
 
     if (!gfx_wapi->start_frame()) {
         dropped_frame = true;
@@ -3195,7 +3322,7 @@ extern "C" void gfx_set_target_fps(int fps) {
 }
 
 extern "C" void gfx_set_texture_filter(enum FilteringMode mode) {
-    gfx_texture_cache_clear();
+    gfx_texture_cache_clear_native(true);
     if (rendering_state.shader_program) {
         gfx_rapi->unload_shader(rendering_state.shader_program);
         rendering_state.shader_program = nullptr;

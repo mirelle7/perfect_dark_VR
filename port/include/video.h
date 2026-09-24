@@ -78,6 +78,7 @@ void videoResizeFramebuffer(s32 target, u32 w, u32 h, s32 upscale, s32 autoresiz
 s32 videoFramebuffersSupported(void);
 
 void videoResetTextureCache(void);
+void videoFinishStageLoad(void);
 void videoFreeCachedTexture(const void *texptr);
 
 void videoShutdown(void);

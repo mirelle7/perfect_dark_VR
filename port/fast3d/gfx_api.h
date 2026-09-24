@@ -47,6 +47,8 @@ void gfx_end_frame(void);
 void gfx_set_target_fps(int);
 void gfx_set_texture_filter(enum FilteringMode mode);
 void gfx_texture_cache_clear(void);
+void gfx_texture_cache_reset_stage(void);
+void gfx_ext_tex_finish_stage_load(void);
 void gfx_texture_cache_delete(const uint8_t *orig_addr);
 int gfx_create_framebuffer(uint32_t width, uint32_t height, int upscale, int autoresize);
 void gfx_resize_framebuffer(int fb, uint32_t width, uint32_t height, int upscale, int autoresize);

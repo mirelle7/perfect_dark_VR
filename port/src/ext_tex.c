@@ -28,10 +28,11 @@
 // ============================================================================
 // CONSTANTS & MACROS
 // ============================================================================
-#define MAX_PENDING_LOADS 256
-#define MAX_EXT_TEX       8192
-#define NUM_FONTS         5
-#define FONT_OUTLINES_DIR "outlines"
+#define MAX_EXT_TEX        8192
+#define MAX_MODEL_FILES    4096
+#define NUM_FONTS          5
+#define FONT_OUTLINES_DIR  "outlines"
+#define EXT_DECODE_THREADS 3
 
 #define FONT_HANDELGOTHICSM 0
 #define FONT_HANDELGOTHICMD 1
@@ -47,20 +48,27 @@
 
 const u16 IDMASK_FONT_OUTLINE = MASK_FONT_OUTLINE << 8;
 
+// Lifecycle of one replacement texture:
+//   IDLE   -> QUEUED  (requested by a prefetch or by a draw)
+//   QUEUED -> READY   (decoded by a worker, pixels in texdata)
+//   QUEUED -> FAILED  (missing or corrupt file, never retried)
+//   READY  -> IDLE    (pixels taken by the renderer and uploaded to the GPU)
+enum {
+    EXT_IDLE = 0,
+    EXT_QUEUED,
+    EXT_READY,
+    EXT_FAILED,
+};
+
 // ============================================================================
 // TYPES & STRUCTURES
 // ============================================================================
-struct PendingLoad {
-    u8 type;
-    u16 id;
-    s32 texnum;
-    _Atomic(int) state; // 0 = free, 1 = pending, 2 = decoded, 3 = consumed
-};
-
 struct ExtTexture {
     u8 *texdata;
     s32 texnum;
-    u32 width, height;
+    u32 width;
+    u32 height;
+    _Atomic(int) state;
     char extension[5];
 };
 
@@ -70,30 +78,59 @@ struct ModelTextures {
     struct ExtTexture *textures;
 };
 
+struct ExtJob {
+    u8 type;
+    u16 id;
+    s32 texnum;
+};
+
+struct JobRing {
+    struct ExtJob *items;
+    s32 cap;
+    s32 head;
+    s32 count;
+};
+
 // ============================================================================
 // GLOBAL VARIABLES
 // ============================================================================
-// Threading & Async Loading State
-static struct PendingLoad pendingLoads[MAX_PENDING_LOADS];
-static pthread_mutex_t    pendingMutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t     pendingCond  = PTHREAD_COND_INITIALIZER;
-static pthread_t          decodeThreadHandle;
-static _Atomic(int)       decodeThreadRunning = 0;
-static _Atomic(int)       decodeThreadStarted = 0;
+// Decode workers. Both rings are protected by jobMutex.
+static pthread_mutex_t jobMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  jobCond  = PTHREAD_COND_INITIALIZER;
+static struct JobRing  decodeRing;
+static struct JobRing  readyRing;
+static pthread_t       decodeThreads[EXT_DECODE_THREADS];
+static s32             numDecodeThreads = 0;
+static _Atomic(int)    decodeThreadsRunning = 0;
+static _Atomic(int)    inflight = 0; // queued + decoding + decoded but not yet uploaded
+
+// Pack change requests, applied on the render thread.
+static pthread_mutex_t packMutex = PTHREAD_MUTEX_INITIALIZER;
+static char            pendingPackName[FS_MAXPATH] = "";
+static s32             pendingPackChange = 0;
 
 // Texture State
 char g_ActiveExtTexPack[FS_MAXPATH] = ""; // Name of the chosen pack folder
 static char extTexPath[FS_MAXPATH + 1];
+static s32 packLoaded = 0;
+static s32 numRegistered = 0;
 
 static struct ExtTexture extTextures[MAX_EXT_TEX];
 static struct ModelTextures *modelTextures;
 static s32 numModels;
+static s32 maxModels = 0;
 
 static struct ExtTexture fontExtTextures[NUM_FONTS][NCHARS];
 static struct ExtTexture fontOutlineExtTextures[NUM_FONTS][NCHARS];
 
-static s32 g_CurrentMaxModels = 0;
-static bool g_IsExtTexFirstInit = true;
+// Everything the current stage has loaded, so a pack enabled mid-stage can
+// prefetch what is already on screen.
+static u8 recordedGeneral[MAX_EXT_TEX];
+static u8 recordedModels[MAX_MODEL_FILES];
+
+// Implemented by the renderer: true when the HD version of this texture is
+// already on the GPU, so prefetching it again would only waste a decode.
+extern s32 gfx_ext_tex_resident(u8 type, u16 id, s32 texnum);
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -104,82 +141,41 @@ static int is_hex_string(const char *str);
 u8 getTexPath(char *dst, u8 type, u16 id, s32 texnum);
 
 // ============================================================================
-// ASYNC TEXTURE LOADING & THREADING
+// JOB RINGS
 // ============================================================================
 
-void extTexAsyncShutdown(void)
+static void ringAlloc(struct JobRing *ring, s32 cap)
 {
-    if (!atomic_load(&decodeThreadStarted))
-        return;
-
-    atomic_store(&decodeThreadRunning, 0);
-
-    /* Wake up the thread if it is waiting on the condition variable */
-    pthread_mutex_lock(&pendingMutex);
-    pthread_cond_broadcast(&pendingCond);
-    pthread_mutex_unlock(&pendingMutex);
-
-    pthread_join(decodeThreadHandle, NULL);
-    atomic_store(&decodeThreadStarted, 0);
+    ring->items = sysMemRealloc(ring->items, cap * sizeof(struct ExtJob));
+    ring->cap = cap;
+    ring->head = 0;
+    ring->count = 0;
 }
 
-// Returns the number of consumed entries (texture ready to be uploaded).
-s32 extTexPollReady(u8 *outType, u16 *outId, s32 *outTexnum, s32 maxOut)
+static s32 ringPush(struct JobRing *ring, u8 type, u16 id, s32 texnum)
 {
-    s32 count = 0;
-    pthread_mutex_lock(&pendingMutex);
-    for (int i = 0; i < MAX_PENDING_LOADS && count < maxOut; ++i) {
-        if (atomic_load(&pendingLoads[i].state) == 2) {
-            outType[count] = pendingLoads[i].type;
-            outId[count] = pendingLoads[i].id;
-            outTexnum[count] = pendingLoads[i].texnum;
-            atomic_store(&pendingLoads[i].state, 0);
-            count++;
-        }
+    if (ring->count >= ring->cap) {
+        return 0;
     }
-    pthread_mutex_unlock(&pendingMutex);
-    return count;
+
+    struct ExtJob *job = &ring->items[(ring->head + ring->count) % ring->cap];
+    job->type = type;
+    job->id = id;
+    job->texnum = texnum;
+    ring->count++;
+    return 1;
 }
 
-static void extTexEnsureThreadStarted(void)
+static s32 ringPop(struct JobRing *ring, struct ExtJob *out)
 {
-    if (atomic_exchange(&decodeThreadStarted, 1) == 0) {
-        atomic_store(&decodeThreadRunning, 1);
-        for (int i = 0; i < MAX_PENDING_LOADS; ++i)
-            atomic_store(&pendingLoads[i].state, 0);
-        pthread_create(&decodeThreadHandle, NULL, extTexDecodeThreadFunc, NULL);
-    }
-}
-
-static void extTexEnqueueLoad(u8 type, u16 id, s32 texnum)
-{
-    extTexEnsureThreadStarted();
-
-    pthread_mutex_lock(&pendingMutex);
-
-    // 1. Avoid duplicates: check if the texture is already in the queue
-    for (int i = 0; i < MAX_PENDING_LOADS; ++i) {
-        if (atomic_load(&pendingLoads[i].state) != 0 &&
-            pendingLoads[i].type == type &&
-            pendingLoads[i].id == id &&
-            pendingLoads[i].texnum == texnum) {
-            pthread_mutex_unlock(&pendingMutex);
-            return; // Already being decoded, cancel the addition!
-        }
+    if (ring->count == 0) {
+        return 0;
     }
 
-    // 2. Find a free slot for the new request
-    for (int i = 0; i < MAX_PENDING_LOADS; ++i) {
-        if (atomic_load(&pendingLoads[i].state) == 0) {
-            pendingLoads[i].type = type;
-            pendingLoads[i].id = id;
-            pendingLoads[i].texnum = texnum;
-            atomic_store(&pendingLoads[i].state, 1);
-            pthread_cond_signal(&pendingCond);
-            break;
-        }
-    }
-    pthread_mutex_unlock(&pendingMutex);
+    *out = ring->items[ring->head];
+    ring->head = (ring->head + 1) % ring->cap;
+    ring->count--;
+    return 1;
 }
 
 // ============================================================================
@@ -188,37 +184,42 @@ static void extTexEnqueueLoad(u8 type, u16 id, s32 texnum)
 
 s32 fileInfo(const char *filename, s32 *texNum, char extension[5])
 {
-    char *ext = strrchr(filename, '.');
+    const char *ext = strrchr(filename, '.');
 
     // No extension
-    if (!ext) return 1;
+    if (!ext || ext == filename) return 1;
 
     ++ext;
-    strncpy(extension, ext, 5);
+    if (strlen(ext) >= 5) return 1;
+    strcpy(extension, ext);
 
-    // Get the filename without extension
+    // Get the filename without extension. Only pure hex names are texture
+    // numbers: "cover.png" would otherwise parse as texture 0x0c.
     char basename[256] = { 0 };
-    memcpy(basename, filename, strlen(filename) - strlen(ext) - 1);
+    size_t len = ext - filename - 1;
+    if (len >= sizeof(basename)) return 1;
+    memcpy(basename, filename, len);
+
+    if (!is_hex_string(basename)) return 1;
 
     *texNum = strtol(basename, NULL, 16);
 
     return 0;
 }
 
-struct ExtTexture *lookupModelTex(u16 fileNum, s32 texNum)
+static struct ModelTextures *lookupModel(u16 fileNum)
 {
-    if (fileNum > NUM_FILES) {
-        sysLogPrintf(LOG_WARNING, "Invalid fileNum in lookupModelTex: %04x, texNum: %04x", fileNum, texNum);
-        return 0;
+    for (int i = 0; i < numModels; ++i) {
+        if (modelTextures[i].fileNum == fileNum)
+            return &modelTextures[i];
     }
 
-    struct ModelTextures *modelTex = NULL;
-    for (int i = 0; i < numModels; ++i) {
-        if (modelTextures[i].fileNum == fileNum) {
-            modelTex = &modelTextures[i];
-            break;
-        }
-    }
+    return NULL;
+}
+
+struct ExtTexture *lookupModelTex(u16 fileNum, s32 texNum)
+{
+    struct ModelTextures *modelTex = lookupModel(fileNum);
 
     if (modelTex == NULL)
         return NULL;
@@ -237,14 +238,20 @@ struct ExtTexture *getExtTexture(u8 type, u16 id, s32 texnum)
         case G_TEXTYPE_NONE:
             return NULL;
         case G_TEXTYPE_GENERAL:
+            if (texnum < 0 || texnum >= MAX_EXT_TEX)
+                return NULL;
             return &extTextures[texnum];
         case G_TEXTYPE_MODEL:
             return lookupModelTex(id, texnum);
         case G_TEXTYPE_FONT: {
-            if (id & IDMASK_FONT_OUTLINE)
-                return &fontOutlineExtTextures[id & ~IDMASK_FONT_OUTLINE][texnum];
+            u16 font = id & ~IDMASK_FONT_OUTLINE;
+            if (font >= NUM_FONTS || texnum < 0 || texnum >= NCHARS)
+                return NULL;
 
-            return &fontExtTextures[id][texnum];
+            if (id & IDMASK_FONT_OUTLINE)
+                return &fontOutlineExtTextures[font][texnum];
+
+            return &fontExtTextures[font][texnum];
         }
         default:
             sysLogPrintf(LOG_WARNING, "Invalid Texture type: %d, texnum: %04x", type, texnum);
@@ -255,7 +262,7 @@ struct ExtTexture *getExtTexture(u8 type, u16 id, s32 texnum)
 u8 extTexExists(u8 type, u16 id, s32 texnum)
 {
     struct ExtTexture *tex = getExtTexture(type, id, texnum);
-    return tex && tex->texnum >= 0;
+    return tex && tex->texnum >= 0 && atomic_load(&tex->state) != EXT_FAILED;
 }
 
 char *resolveFontname(const u8 fontId)
@@ -272,12 +279,15 @@ char *resolveFontname(const u8 fontId)
 
 u8 getTexPath(char *dst, u8 type, u16 id, s32 texnum)
 {
-    struct ExtTexture *tex;
+    struct ExtTexture *tex = getExtTexture(type, id, texnum);
     const char *name;
+
+    if (!tex) {
+        return 1;
+    }
 
     switch (type) {
         case G_TEXTYPE_GENERAL: {
-            tex = &extTextures[texnum];
             snprintf(dst, FS_MAXPATH, "%s/%04x.%s", extTexPath, texnum, tex->extension);
             return 0;
         }
@@ -285,18 +295,15 @@ u8 getTexPath(char *dst, u8 type, u16 id, s32 texnum)
             name = resolveFontname(id & ~IDMASK_FONT_OUTLINE);
 
             if (id & IDMASK_FONT_OUTLINE) {
-                tex = &fontOutlineExtTextures[id & ~IDMASK_FONT_OUTLINE][texnum];
                 snprintf(dst, FS_MAXPATH, "%s/%s/" FONT_OUTLINES_DIR "/%02x.%s", extTexPath, name, texnum, tex->extension);
                 return 0;
             }
 
-            tex = &fontExtTextures[id][texnum];
             snprintf(dst, FS_MAXPATH, "%s/%s/%02x.%s", extTexPath, name, texnum, tex->extension);
             return 0;
         }
         case G_TEXTYPE_MODEL: {
             name = romdataFileGetName(id);
-            tex = lookupModelTex(id, texnum);
             snprintf(dst, FS_MAXPATH, "%s/%s/%05x.%s", extTexPath, name, texnum, tex->extension);
             return 0;
         }
@@ -305,91 +312,280 @@ u8 getTexPath(char *dst, u8 type, u16 id, s32 texnum)
 }
 
 // ============================================================================
-// TEXTURE LOADING & PROCESSING
+// ASYNC TEXTURE LOADING & THREADING
 // ============================================================================
 
+static void extTexEnsureThreadsStarted(void)
+{
+    if (numDecodeThreads > 0) {
+        return;
+    }
+
+    atomic_store(&decodeThreadsRunning, 1);
+
+    for (int i = 0; i < EXT_DECODE_THREADS; ++i) {
+        if (pthread_create(&decodeThreads[i], NULL, extTexDecodeThreadFunc, NULL) == 0) {
+            numDecodeThreads++;
+        }
+    }
+}
+
+void extTexAsyncShutdown(void)
+{
+    if (numDecodeThreads == 0)
+        return;
+
+    pthread_mutex_lock(&jobMutex);
+    atomic_store(&decodeThreadsRunning, 0);
+    pthread_cond_broadcast(&jobCond);
+    pthread_mutex_unlock(&jobMutex);
+
+    for (int i = 0; i < numDecodeThreads; ++i) {
+        pthread_join(decodeThreads[i], NULL);
+    }
+
+    numDecodeThreads = 0;
+}
+
+static void extTexEnqueueLoad(u8 type, u16 id, s32 texnum)
+{
+    struct ExtTexture *tex = getExtTexture(type, id, texnum);
+
+    if (!tex || tex->texnum < 0) {
+        return;
+    }
+
+    // The state machine is the duplicate check: only an idle texture is queued.
+    int expected = EXT_IDLE;
+    if (!atomic_compare_exchange_strong(&tex->state, &expected, EXT_QUEUED)) {
+        return;
+    }
+
+    extTexEnsureThreadsStarted();
+
+    pthread_mutex_lock(&jobMutex);
+    if (ringPush(&decodeRing, type, id, texnum)) {
+        atomic_fetch_add(&inflight, 1);
+        pthread_cond_signal(&jobCond);
+    } else {
+        atomic_store(&tex->state, EXT_IDLE);
+    }
+    pthread_mutex_unlock(&jobMutex);
+}
+
+// Moves a decoded texture's pixels to the caller. Returns NULL if someone else
+// already took them.
+static u8 *extTexTake(struct ExtTexture *tex, u32 *width, u32 *height)
+{
+    int expected = EXT_READY;
+    if (!atomic_compare_exchange_strong(&tex->state, &expected, EXT_IDLE)) {
+        return NULL;
+    }
+
+    u8 *pixels = tex->texdata;
+    tex->texdata = NULL;
+    *width = tex->width;
+    *height = tex->height;
+    atomic_fetch_sub(&inflight, 1);
+    return pixels;
+}
+
+// Called by the renderer when it needs this texture now. Returns the decoded
+// pixels if they are ready (the caller uploads them and frees them with
+// extTexFreePixels), otherwise queues the decode and returns NULL.
 u8 *extTexLoad(u8 type, u16 id, s32 texnum, u32 *width, u32 *height)
 {
     struct ExtTexture *tex = getExtTexture(type, id, texnum);
 
-    // If texnum < 0, the texture failed previously, ignore it.
     if (!tex || tex->texnum < 0) {
         return NULL;
     }
 
-    // Already decoded by the background thread: fast path, no I/O.
-    if (tex->texdata) {
-        *width = tex->width;
-        *height = tex->height;
-        return tex->texdata;
+    u8 *pixels = extTexTake(tex, width, height);
+    if (pixels) {
+        return pixels;
     }
 
-    // Not ready yet: start the decoding task (only once)
-    // and return NULL immediately -> the pink placeholder is displayed this frame.
     extTexEnqueueLoad(type, id, texnum);
     return NULL;
 }
 
+void extTexFreePixels(u8 *pixels)
+{
+    if (pixels) {
+        stbi_image_free(pixels);
+    }
+}
+
+u8 *extTexTakeReady(u8 *outType, u16 *outId, s32 *outTexnum, u32 *outWidth, u32 *outHeight)
+{
+    struct ExtJob job;
+
+    pthread_mutex_lock(&jobMutex);
+    while (ringPop(&readyRing, &job)) {
+        struct ExtTexture *tex = getExtTexture(job.type, job.id, job.texnum);
+        // Skip entries whose pixels a draw already took.
+        u8 *pixels = tex ? extTexTake(tex, outWidth, outHeight) : NULL;
+        if (pixels) {
+            pthread_mutex_unlock(&jobMutex);
+            *outType = job.type;
+            *outId = job.id;
+            *outTexnum = job.texnum;
+            return pixels;
+        }
+    }
+    pthread_mutex_unlock(&jobMutex);
+
+    return NULL;
+}
+
+s32 extTexInflight(void)
+{
+    return atomic_load(&inflight);
+}
+
 static void *extTexDecodeThreadFunc(void *arg)
 {
-    while (atomic_load(&decodeThreadRunning)) {
-        int found = -1;
+    for (;;) {
+        struct ExtJob job;
 
-        pthread_mutex_lock(&pendingMutex);
-        for (;;) {
-            for (int i = 0; i < MAX_PENDING_LOADS; ++i) {
-                if (atomic_load(&pendingLoads[i].state) == 1) {
-                    found = i;
-                    break;
-                }
-            }
-            if (found >= 0 || !atomic_load(&decodeThreadRunning))
-                break;
-            pthread_cond_wait(&pendingCond, &pendingMutex);
+        pthread_mutex_lock(&jobMutex);
+        while (atomic_load(&decodeThreadsRunning) && decodeRing.count == 0) {
+            pthread_cond_wait(&jobCond, &jobMutex);
         }
-        pthread_mutex_unlock(&pendingMutex);
-
-        if (found < 0)
+        if (!atomic_load(&decodeThreadsRunning)) {
+            pthread_mutex_unlock(&jobMutex);
             break;
+        }
+        ringPop(&decodeRing, &job);
+        pthread_mutex_unlock(&jobMutex);
 
-        struct PendingLoad *job = &pendingLoads[found];
+        struct ExtTexture *tex = getExtTexture(job.type, job.id, job.texnum);
         char path[FS_MAXPATH];
+        u8 *pixels = NULL;
+        int w = 0, h = 0, channels = 0;
 
-        if (getTexPath(path, job->type, job->id, job->texnum) == 0) {
-            struct ExtTexture *tex = getExtTexture(job->type, job->id, job->texnum);
+        if (tex && getTexPath(path, job.type, job.id, job.texnum) == 0) {
+            pixels = stbi_load(path, &w, &h, &channels, 4);
+        }
+
+        if (!pixels) {
+            // The image does not exist or is corrupted: never try it again.
             if (tex) {
-                u32 w, h, channels;
-                u8 *pixels = stbi_load(path, (int*)&w, (int*)&h, (int*)&channels, 4);
-                if (pixels) {
-                    // Flip the texture to match the N64 rendering order!
-                    for (int y = 0; y < (int)h / 2; y++) {
-                        u8 *a = pixels + w * 4 * y;
-                        u8 *b = pixels + w * 4 * ((int)h - 1 - y);
-                        for (int x = 0; x < (int)w * 4; x++) {
-                            u8 tmp = a[x];
-                            a[x] = b[x];
-                            b[x] = tmp;
-                        }
-                    }
+                atomic_store(&tex->state, EXT_FAILED);
+            }
+            atomic_fetch_sub(&inflight, 1);
+            continue;
+        }
 
-                    if (pixels) {
-                        tex->width = w;
-                        tex->height = h;
-                        tex->texdata = pixels;
-                    } else {
-                        tex->texnum = -1;
-                    }
-
-                    tex->texdata = pixels;
-                } else {
-                    // The image does not exist or is corrupted, invalidate it permanently
-                    tex->texnum = -1;
-                }
+        // Flip the texture to match the N64 rendering order!
+        for (int y = 0; y < h / 2; y++) {
+            u8 *a = pixels + (size_t)w * 4 * y;
+            u8 *b = pixels + (size_t)w * 4 * (h - 1 - y);
+            for (int x = 0; x < w * 4; x++) {
+                u8 tmp = a[x];
+                a[x] = b[x];
+                b[x] = tmp;
             }
         }
-        atomic_store(&job->state, 2);
+
+        tex->texdata = pixels;
+        tex->width = w;
+        tex->height = h;
+        atomic_store(&tex->state, EXT_READY);
+
+        pthread_mutex_lock(&jobMutex);
+        ringPush(&readyRing, job.type, job.id, job.texnum);
+        pthread_mutex_unlock(&jobMutex);
     }
+
     return NULL;
+}
+
+// ============================================================================
+// PREFETCHING
+// ============================================================================
+
+static s32 extTexPrefetchEnabled(void)
+{
+    return packLoaded && videoGetExternalTextures();
+}
+
+static void extTexPrefetchOne(u8 type, u16 id, s32 texnum)
+{
+    if (extTexExists(type, id, texnum) && !gfx_ext_tex_resident(type, id, texnum)) {
+        extTexEnqueueLoad(type, id, texnum);
+    }
+}
+
+void extTexStageBegin(void)
+{
+    memset(recordedGeneral, 0, sizeof(recordedGeneral));
+    memset(recordedModels, 0, sizeof(recordedModels));
+}
+
+void extTexPrefetch(u8 type, u16 id, s32 texnum)
+{
+    if (type == G_TEXTYPE_GENERAL && texnum >= 0 && texnum < MAX_EXT_TEX) {
+        recordedGeneral[texnum] = 1;
+    }
+
+    if (extTexPrefetchEnabled()) {
+        extTexPrefetchOne(type, id, texnum);
+    }
+}
+
+static void extTexPrefetchModelTextures(s32 fileNum)
+{
+    struct ModelTextures *modelTex = lookupModel(fileNum);
+
+    if (modelTex == NULL) {
+        return;
+    }
+
+    for (int i = 0; i < modelTex->numTextures; ++i) {
+        extTexPrefetchOne(G_TEXTYPE_MODEL, fileNum, modelTex->textures[i].texnum);
+    }
+}
+
+void extTexPrefetchModel(s32 fileNum)
+{
+    if (fileNum < 0 || fileNum >= MAX_MODEL_FILES) {
+        return;
+    }
+
+    recordedModels[fileNum] = 1;
+
+    if (extTexPrefetchEnabled()) {
+        extTexPrefetchModelTextures(fileNum);
+    }
+}
+
+// Queues the fonts and everything the current stage has loaded so far.
+void extTexPrefetchRecorded(void)
+{
+    if (!extTexPrefetchEnabled()) {
+        return;
+    }
+
+    for (int i = 0; i < NUM_FONTS; ++i) {
+        for (int j = 0; j < NCHARS; ++j) {
+            extTexPrefetchOne(G_TEXTYPE_FONT, i, j);
+            extTexPrefetchOne(G_TEXTYPE_FONT, i | IDMASK_FONT_OUTLINE, j);
+        }
+    }
+
+    for (int i = 0; i < MAX_EXT_TEX; ++i) {
+        if (recordedGeneral[i]) {
+            extTexPrefetchOne(G_TEXTYPE_GENERAL, 0, i);
+        }
+    }
+
+    for (int i = 0; i < MAX_MODEL_FILES; ++i) {
+        if (recordedModels[i]) {
+            extTexPrefetchModelTextures(i);
+        }
+    }
 }
 
 // ============================================================================
@@ -428,20 +624,38 @@ u8 resolveFontID(const char *fontname)
     return 0xff;
 }
 
+static void resetTex(struct ExtTexture *tex)
+{
+    if (tex->texdata) {
+        stbi_image_free(tex->texdata);
+    }
+
+    tex->texdata = NULL;
+    tex->texnum = -1;
+    tex->width = 0;
+    tex->height = 0;
+    atomic_store(&tex->state, EXT_IDLE);
+}
+
 void setTex(struct ExtTexture *texlist, s32 index, s32 texNum, char extension[5])
 {
     struct ExtTexture *tex = &texlist[index];
+    tex->texdata = NULL;
     tex->texnum = texNum;
+    tex->width = 0;
+    tex->height = 0;
+    atomic_store(&tex->state, EXT_IDLE);
     strcpy(tex->extension, extension);
+    numRegistered++;
 }
 
-void readModelTextures(const char *path, s16 fileNum, s32 *modelOffset, struct ModelTextures *modelTex)
+void readModelTextures(const char *path, s16 fileNum, struct ModelTextures *modelTex)
 {
     DIR *dr = opendir(path);
     struct dirent *de;
 
-    s32 MAX_TEX = 16;
-    modelTex->textures = sysMemAlloc(MAX_TEX * sizeof(struct ExtTexture));
+    s32 maxTex = 16;
+    modelTex->textures = sysMemAlloc(maxTex * sizeof(struct ExtTexture));
     modelTex->numTextures = 0;
     modelTex->fileNum = fileNum;
 
@@ -459,124 +673,134 @@ void readModelTextures(const char *path, s16 fileNum, s32 *modelOffset, struct M
         if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
 
         s32 texNum;
-        s32 err = fileInfo(name, &texNum, extension);
+        if (fileInfo(name, &texNum, extension)) continue;
 
-        // No extension: skip
-        if (err) continue;
+        // Grow before writing so the new entry always fits
+        if (modelTex->numTextures >= maxTex) {
+            maxTex *= 2;
+            modelTex->textures = sysMemRealloc(modelTex->textures, maxTex * sizeof(struct ExtTexture));
+        }
 
         setTex(modelTex->textures, modelTex->numTextures, texNum, extension);
         modelTex->numTextures++;
-
-        // Allocate more memory for model textures if needed
-        if (modelTex->numTextures > MAX_TEX) {
-            MAX_TEX *= 2;
-            modelTex->textures = sysMemRealloc(modelTex->textures, MAX_TEX * sizeof(struct ExtTexture));
-        }
     }
     closedir(dr);
-
-    // Shrink the textures array to the actual number of textures found
-    s32 numTex = modelTex->numTextures;
-
-    if (numTex > 0)
-        modelTex->textures = sysMemRealloc(modelTex->textures, numTex * sizeof(struct ExtTexture));
-
-    for (int i = 0; i < modelTex->numTextures; ++i) {
-        modelTex->textures[i].texdata = 0;
-    }
 }
 
-void readFontTextures(const char *path, const char *fontName)
+void readFontTextures(const char *path, u8 fontID)
 {
-    DIR *dr = opendir(path);
-    struct dirent *de;
-
-    u8 fontID = resolveFontID(fontName);
-    char extension[5] = { 0 };
-
     char outlinesPath[FS_MAXPATH];
-    sprintf(outlinesPath, "%s/" FONT_OUTLINES_DIR, path);
-    u8 outlines = false;
+    snprintf(outlinesPath, sizeof(outlinesPath), "%s/" FONT_OUTLINES_DIR, path);
 
-    /* The font's directory itself is missing: nothing to read. */
-    if (dr == NULL) {
-        return;
-    }
+    for (int outlines = 0; outlines < 2; ++outlines) {
+        DIR *dr = opendir(outlines ? outlinesPath : path);
+        struct dirent *de;
+        char extension[5] = { 0 };
 
-    while (true) {
-        de = readdir(dr);
-        // After done processing the font folder, do the same for the outlines folder if any
-        if (de == NULL) {
-            if (outlines) break;
+        /* The "outlines" subdirectory is optional */
+        if (dr == NULL) continue;
 
-            outlines = true;
-            closedir(dr);
-            dr = opendir(outlinesPath);
+        while ((de = readdir(dr)) != NULL) {
+            const char *name = de->d_name;
+            if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
 
-            /* The "outlines" subdirectory is optional: if it doesn't exist,
-             * stop cleanly instead of calling readdir(NULL). */
-            if (dr == NULL) break;
+            s32 texNum;
+            if (fileInfo(name, &texNum, extension)) continue;
+            if (texNum < 0 || texNum >= NCHARS) continue;
 
-            de = readdir(dr);
-            if (de == NULL) break;
+            if (outlines)
+                setTex(fontOutlineExtTextures[fontID], texNum, texNum, extension);
+            else
+                setTex(fontExtTextures[fontID], texNum, texNum, extension);
         }
 
-        const char *name = de->d_name;
-        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
-
-        s32 texNum;
-        s32 err = fileInfo(name, &texNum, extension);
-
-        // No extension: skip
-        if (err) continue;
-
-        if (outlines)
-            setTex(fontOutlineExtTextures[fontID], texNum, texNum, extension);
-        else
-            setTex(fontExtTextures[fontID], texNum, texNum, extension);
-    }
-
-    /* dr may be NULL here if opening the outlines directory failed:
-     * do not call closedir(NULL). */
-    if (dr != NULL)
         closedir(dr);
+    }
 }
 
 // ============================================================================
 // CLEANUP
 // ============================================================================
 
-void extTexFree(void)
+// Frees all decoded pixels and forgets the pack. The decode workers must be
+// stopped first.
+static void extTexResetTables(void)
 {
     for (int i = 0; i < MAX_EXT_TEX; ++i) {
-        if (extTextures[i].texdata)
-            stbi_image_free(extTextures[i].texdata);
-
-        extTextures[i].texdata = 0;
+        resetTex(&extTextures[i]);
     }
 
     for (int i = 0; i < NUM_FONTS; ++i) {
         for (int j = 0; j < NCHARS; ++j) {
-            if (fontExtTextures[i][j].texdata)
-                stbi_image_free(fontExtTextures[i][j].texdata);
-
-            if (fontOutlineExtTextures[i][j].texdata)
-                stbi_image_free(fontOutlineExtTextures[i][j].texdata);
-
-            fontExtTextures[i][j].texdata = 0;
-            fontOutlineExtTextures[i][j].texdata = 0;
+            resetTex(&fontExtTextures[i][j]);
+            resetTex(&fontOutlineExtTextures[i][j]);
         }
     }
 
     for (int i = 0; i < numModels; ++i) {
         struct ModelTextures *modelTex = &modelTextures[i];
         for (int j = 0; j < modelTex->numTextures; ++j) {
-            if (modelTex->textures[j].texdata)
-                stbi_image_free(modelTex->textures[j].texdata);
+            resetTex(&modelTex->textures[j]);
+        }
+        sysMemFree(modelTex->textures);
+        modelTex->textures = NULL;
+    }
 
-            modelTex->textures[j].texdata = 0;
+    numModels = 0;
+    numRegistered = 0;
+    packLoaded = 0;
+    atomic_store(&inflight, 0);
+
+    pthread_mutex_lock(&jobMutex);
+    decodeRing.head = decodeRing.count = 0;
+    readyRing.head = readyRing.count = 0;
+    pthread_mutex_unlock(&jobMutex);
+}
+
+// Frees decoded pixels that were never uploaded. Keeps the pack's file list.
+void extTexFree(void)
+{
+    extTexAsyncShutdown();
+
+    struct ExtTexture *tex;
+
+    for (int i = 0; i < MAX_EXT_TEX; ++i) {
+        tex = &extTextures[i];
+        extTexFreePixels(tex->texdata);
+        tex->texdata = NULL;
+        if (atomic_load(&tex->state) != EXT_FAILED) atomic_store(&tex->state, EXT_IDLE);
+    }
+
+    for (int i = 0; i < NUM_FONTS; ++i) {
+        for (int j = 0; j < NCHARS; ++j) {
+            tex = &fontExtTextures[i][j];
+            extTexFreePixels(tex->texdata);
+            tex->texdata = NULL;
+            if (atomic_load(&tex->state) != EXT_FAILED) atomic_store(&tex->state, EXT_IDLE);
+
+            tex = &fontOutlineExtTextures[i][j];
+            extTexFreePixels(tex->texdata);
+            tex->texdata = NULL;
+            if (atomic_load(&tex->state) != EXT_FAILED) atomic_store(&tex->state, EXT_IDLE);
         }
     }
+
+    for (int i = 0; i < numModels; ++i) {
+        struct ModelTextures *modelTex = &modelTextures[i];
+        for (int j = 0; j < modelTex->numTextures; ++j) {
+            tex = &modelTex->textures[j];
+            extTexFreePixels(tex->texdata);
+            tex->texdata = NULL;
+            if (atomic_load(&tex->state) != EXT_FAILED) atomic_store(&tex->state, EXT_IDLE);
+        }
+    }
+
+    atomic_store(&inflight, 0);
+
+    pthread_mutex_lock(&jobMutex);
+    decodeRing.head = decodeRing.count = 0;
+    readyRing.head = readyRing.count = 0;
+    pthread_mutex_unlock(&jobMutex);
 }
 
 // ============================================================================
@@ -671,14 +895,15 @@ static int findTruePackRoot(char *currentPath)
     return 0; // Dead end
 }
 
-
-
 // ============================================================================
 // SYSTEM INITIALIZATION
 // ============================================================================
 
+// Scans the active pack's files. The decode workers must be stopped.
 s32 extTexInit(void)
 {
+    extTexResetTables();
+
     // 1. Add $S/ to force creation next to the executable
     const char *rootPath = fsFullPath("$S/texture-packs");
     struct stat stRoot;
@@ -703,33 +928,13 @@ s32 extTexInit(void)
         sysLogPrintf(LOG_NOTE, "ext_tex: True texture root found -> %s", extTexPath);
     }
 
-    // 4. Reset pointers during the very first initialization
-    if (g_IsExtTexFirstInit) {
-        for (int i = 0; i < MAX_EXT_TEX; ++i) {
-            extTextures[i].texnum = -1;
-            extTextures[i].texdata = 0;
-        }
-        for (int i = 0; i < NUM_FONTS; ++i) {
-            for (int j = 0; j < NCHARS; ++j) {
-                fontExtTextures[i][j].texnum = -1;
-                fontExtTextures[i][j].texdata = 0;
-                fontOutlineExtTextures[i][j].texnum = -1;
-                fontOutlineExtTextures[i][j].texdata = 0;
-            }
-        }
-        g_IsExtTexFirstInit = false;
-    }
-
     struct dirent *de;
     DIR *dr = opendir(extTexPath);
     char filepath[FS_MAXPATH];
-    s32 modelOffset = 0;
-    numModels = 0;
 
-    // 5. Initial allocation of the memory block (only once)
-    if (g_CurrentMaxModels == 0) {
-        g_CurrentMaxModels = 16;
-        modelTextures = sysMemAlloc(g_CurrentMaxModels * sizeof(struct ModelTextures));
+    if (maxModels == 0) {
+        maxModels = 16;
+        modelTextures = sysMemAlloc(maxModels * sizeof(struct ModelTextures));
     }
 
     if (dr != NULL) {
@@ -738,74 +943,88 @@ s32 extTexInit(void)
             if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
 
             struct stat stbuf;
-            sprintf(filepath, "%s/%s", extTexPath, de->d_name);
+            snprintf(filepath, sizeof(filepath), "%s/%s", extTexPath, de->d_name);
             if (stat(filepath, &stbuf) == -1) continue;
 
             if (S_ISDIR(stbuf.st_mode)) {
                 char s = name[0];
                 if (s == 'P' || s == 'C' || s == 'G') {
-                    s16 fileNum = (s16)romdataFileGetNumForName(name);
+                    s32 fileNum = romdataFileGetNumForName(name);
                     if (fileNum < 0) continue;
 
-                    struct ModelTextures *modelTex = &modelTextures[numModels++];
-                    readModelTextures(filepath, fileNum, &modelOffset, modelTex);
-
-                    // Protected dynamic reallocation
-                    if (numModels >= g_CurrentMaxModels) {
-                        g_CurrentMaxModels *= 2;
-                        modelTextures = sysMemRealloc(modelTextures, g_CurrentMaxModels * sizeof(struct ModelTextures));
+                    if (numModels >= maxModels) {
+                        maxModels *= 2;
+                        modelTextures = sysMemRealloc(modelTextures, maxModels * sizeof(struct ModelTextures));
                     }
+
+                    readModelTextures(filepath, (s16)fileNum, &modelTextures[numModels++]);
                 } else if (s == 'f') {
-                    readFontTextures(filepath, name);
+                    u8 fontID = resolveFontID(name);
+                    if (fontID != 0xff) {
+                        readFontTextures(filepath, fontID);
+                    }
                 }
             } else {
                 s32 texNum = 0;
                 char extension[5] = { 0 };
-                if (!fileInfo(name, &texNum, extension)) {
+                if (!fileInfo(name, &texNum, extension) && texNum >= 0 && texNum < MAX_EXT_TEX) {
                     setTex(extTextures, texNum, texNum, extension);
                 }
             }
         }
         closedir(dr);
-
     }
+
+    // Every texture is in at most one ring at a time, plus stale ready entries
+    // left behind when a draw takes pixels directly.
+    s32 cap = numRegistered * 2 + 64;
+    pthread_mutex_lock(&jobMutex);
+    ringAlloc(&decodeRing, cap);
+    ringAlloc(&readyRing, cap);
+    pthread_mutex_unlock(&jobMutex);
+
+    packLoaded = numRegistered > 0;
+    sysLogPrintf(LOG_NOTE, "ext_tex: %d replacement textures in pack %s", numRegistered, g_ActiveExtTexPack);
 
     return 0;
 }
 
 void extTexSetPack(const char *newPackName)
 {
-    // 1. Stop the asynchronous decoding thread if it's running
-    extTexAsyncShutdown();
+    pthread_mutex_lock(&packMutex);
 
-    // 2. Free the texture memory of the old pack
-    extTexFree();
-
-    // 3. Update the name of the new pack
     if (newPackName != NULL) {
-        strncpy(g_ActiveExtTexPack, newPackName, sizeof(g_ActiveExtTexPack) - 1);
-        g_ActiveExtTexPack[sizeof(g_ActiveExtTexPack) - 1] = '\0';
+        strncpy(pendingPackName, newPackName, sizeof(pendingPackName) - 1);
+        pendingPackName[sizeof(pendingPackName) - 1] = '\0';
     } else {
-        g_ActiveExtTexPack[0] = '\0';
+        pendingPackName[0] = '\0';
     }
 
-    // 4. Manually reset the indices
-    for (int i = 0; i < MAX_EXT_TEX; ++i) {
-        extTextures[i].texnum = -1;
-        extTextures[i].texdata = 0;
-    }
-    for (int i = 0; i < NUM_FONTS; ++i) {
-        for (int j = 0; j < NCHARS; ++j) {
-            fontExtTextures[i][j].texnum = -1;
-            fontExtTextures[i][j].texdata = 0;
-            fontOutlineExtTextures[i][j].texnum = -1;
-            fontOutlineExtTextures[i][j].texdata = 0;
-        }
+    // The menus read the active name right after requesting a change
+    strcpy(g_ActiveExtTexPack, pendingPackName);
+    pendingPackChange = 1;
+
+    pthread_mutex_unlock(&packMutex);
+}
+
+// Render thread only. Returns 1 if the pack changed, in which case the caller
+// must drop every external texture from the GPU cache.
+s32 extTexApplyPendingPack(void)
+{
+    pthread_mutex_lock(&packMutex);
+
+    if (!pendingPackChange) {
+        pthread_mutex_unlock(&packMutex);
+        return 0;
     }
 
-    numModels = 0;               // Reset the models
-    g_IsExtTexFirstInit = false; // Prevent extTexInit from overwriting our reset
+    strcpy(g_ActiveExtTexPack, pendingPackName);
+    pendingPackChange = 0;
 
-    // 5. Load the new pack
+    pthread_mutex_unlock(&packMutex);
+
+    extTexAsyncShutdown();
     extTexInit();
+
+    return 1;
 }

@@ -10,6 +10,7 @@
 #include "system.h"
 #include "preprocess.h"
 #include "platform.h"
+#include "ext_tex.h"
 
 /**
  * asset files and ROM segments can be replaced by optional external files,
@@ -517,6 +518,9 @@ void romdataFilePreprocess(s32 fileNum, s32 loadType, u8 *data, u32 size, u32 *o
 		sysLogPrintf(LOG_ERROR, "romdataFilePreprocess: invalid file num %d", fileNum);
 		return;
 	}
+
+	// Start decoding this model's HD textures while it is being loaded
+	extTexPrefetchModel(fileNum);
 
     if (data && size /* && !fileSlots[fileNum].preprocessed*/) {
         if (loadType && loadType < (u32)ARRAYCOUNT(filePreprocFuncs) && filePreprocFuncs[loadType]) {

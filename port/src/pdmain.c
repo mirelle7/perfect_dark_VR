@@ -544,6 +544,7 @@ void mainLoop(void)
         dhudReset();
         zbufReset(g_StageNum);
         lvReset(g_StageNum);
+        videoFinishStageLoad();
         viReset(g_StageNum);
         frametimeCalculate();
         profileReset();
